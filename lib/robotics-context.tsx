@@ -30,6 +30,15 @@ interface RoboticsContextType {
   backendConnected: boolean;
   setBackendConnected: (c: boolean) => void;
   lastSuccessfulPoll: number | null;
+  lastObstaclePost: {
+    timestamp: string;
+    url: string;
+    requestPayload: any;
+    httpStatus: number | null;
+    responseJson: any;
+    error?: string | null;
+  } | null;
+  lastBackendError: string | null;
 
   // Real Backend Data
   apiStatus: ApiStatusResponse | null;
@@ -55,7 +64,7 @@ interface RoboticsContextType {
   toggleObstacle: (p: GridPoint) => void;
   addObstacleInPath: () => void;
   clearObstacles: () => void;
-  resetRover: () => void;
+  resetRover: () => Promise<void>;
   setStartPos: (p: GridPoint) => void;
   setGoalPos: (p: GridPoint) => void;
 
@@ -174,6 +183,15 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
 
   const [backendConnected, setBackendConnected] = useState<boolean>(false);
   const [lastSuccessfulPoll, setLastSuccessfulPoll] = useState<number | null>(null);
+  const [lastObstaclePost, setLastObstaclePost] = useState<{
+    timestamp: string;
+    url: string;
+    requestPayload: any;
+    httpStatus: number | null;
+    responseJson: any;
+    error?: string | null;
+  } | null>(null);
+  const [lastBackendError, setLastBackendError] = useState<string | null>(null);
 
   // Raw responses from Flask API
   const [apiStatus, setApiStatus] = useState<ApiStatusResponse | null>(null);
@@ -237,6 +255,7 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
   const currentReplansRef = useRef<number>(replans);
   const currentNodesRef = useRef<number>(nodesExplored);
   const currentMissionStateRef = useRef<string>(missionState);
+  const currentObstaclesRef = useRef<Set<string>>(obstacles);
 
   // Synchronize refs after render
   useEffect(() => {
@@ -248,7 +267,8 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
     currentReplansRef.current = replans;
     currentNodesRef.current = nodesExplored;
     currentMissionStateRef.current = missionState;
-  }, [roverPos, goalPos, startPos, pathLength, distanceTravelled, replans, nodesExplored, missionState]);
+    currentObstaclesRef.current = obstacles;
+  }, [roverPos, goalPos, startPos, pathLength, distanceTravelled, replans, nodesExplored, missionState, obstacles]);
 
   // Track consecutive failed requests to prevent rapid toggling
   const consecutiveFailuresRef = useRef<number>(0);
@@ -279,6 +299,7 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
+      setLastBackendError(null);
       // 1. Fetch /api/status (Primary health & status endpoint)
       const statusRes = await fetch(`${cleanUrl}/api/status`, {
         signal: controller.signal,
@@ -291,6 +312,7 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
 
       const statusData: ApiStatusResponse = await statusRes.json();
       setApiStatus(statusData);
+      console.log(`[DEBUG 1: fetchBackendData] Polled status from ${cleanUrl || '/api/status'}: state=${statusData.state}, rover_position=${JSON.stringify(statusData.rover_position)}`);
 
       // On a successful response, reset consecutive failure counter immediately
       consecutiveFailuresRef.current = 0;
@@ -382,7 +404,9 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
                 });
               }
             });
-            setObstacles(obsSet);
+            // Merge with local active obstacles so active user obstacles are preserved
+            const mergedObs = new Set([...obsSet, ...currentObstaclesRef.current]);
+            setObstacles(mergedObs);
           }
 
           if (navData.start) setStartPos(parseGridPoint(navData.start, currentStartPosRef.current));
@@ -393,9 +417,24 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
           }
           if (Array.isArray(navData.path)) {
             const parsedPath = parsePathPoints(navData.path);
-            setCurrentPath(parsedPath);
-            if (parsedPath.length > 0 && typeof statusData.path_length !== 'number') {
-              setPathLength(parsedPath.length - 1);
+            const activeObstacles = currentObstaclesRef.current;
+            const pathCollides = parsedPath.some((pt) => activeObstacles.has(`${pt.x},${pt.y}`));
+
+            if (pathCollides && activeObstacles.size > 0) {
+              const res = runPathfinding('A*', currentRoverPosRef.current, currentGoalPosRef.current, activeObstacles);
+              if (res.success && res.path.length > 0) {
+                setCurrentPath(res.path);
+                setPathLength(res.pathLength);
+              } else {
+                setCurrentPath([]);
+                setPathLength(0);
+                setMissionState('NO_SAFE_PATH');
+              }
+            } else {
+              setCurrentPath(parsedPath);
+              if (parsedPath.length > 0 && typeof statusData.path_length !== 'number') {
+                setPathLength(parsedPath.length - 1);
+              }
             }
           }
         }
@@ -448,7 +487,8 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
       }
 
       setLastSuccessfulPoll(Date.now());
-    } catch {
+    } catch (pollErr: any) {
+      setLastBackendError(pollErr?.message || String(pollErr));
       // Requirement 2 & 3: Do NOT mark backend disconnected because of a single failed request.
       // Only show DISCONNECTED after 3 consecutive failed API requests.
       consecutiveFailuresRef.current += 1;
@@ -551,10 +591,71 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
     await fetchBackendData();
   };
 
+  // Helper to send obstacles to backend: POST /api/obstacles with {"obstacles": [[x, y], ...]}
+  const sendObstacles = async (obstaclesList: number[][]) => {
+    const cleanUrl = backendUrl.replace(/\/+$/, '');
+    const payload = { obstacles: obstaclesList };
+    console.log('[DEBUG 1: sendObstacles] Calling POST /api/obstacles with payload:', JSON.stringify(payload));
+    try {
+      // 1. Update the local Next.js API route (shared simulation state used by stepSimulation)
+      const localRes = await fetch('/api/obstacles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      console.log(`[DEBUG 1: sendObstacles] Response from /api/obstacles: status ${localRes.status} (${localRes.statusText})`);
+
+      let localJson: any = null;
+      try {
+        localJson = await localRes.json();
+      } catch {
+        localJson = null;
+      }
+
+      setLastObstaclePost({
+        timestamp: new Date().toLocaleTimeString(),
+        url: '/api/obstacles',
+        requestPayload: payload,
+        httpStatus: localRes.status,
+        responseJson: localJson,
+        error: localRes.ok ? null : `HTTP ${localRes.status} (${localRes.statusText})`,
+      });
+
+      // 2. If a custom external backend URL is configured, also forward to it asynchronously
+      if (cleanUrl && cleanUrl !== '') {
+        try {
+          fetch(`${cleanUrl}/api/obstacles`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          }).catch((err) => {
+            console.log('[DEBUG 1: sendObstacles] Optional external backend notify failed (ignored):', err);
+          });
+        } catch {
+          // Ignore external non-blocking error
+        }
+      }
+    } catch (err: any) {
+      console.error('[DEBUG 1: sendObstacles] POST /api/obstacles error:', err);
+      setLastObstaclePost({
+        timestamp: new Date().toLocaleTimeString(),
+        url: '/api/obstacles',
+        requestPayload: payload,
+        httpStatus: null,
+        responseJson: null,
+        error: err?.message || String(err),
+      });
+    } finally {
+      await fetchBackendData();
+    }
+  };
+
   // Offline / Simulation fallback helpers for interactive manipulation
   const toggleObstacle = (point: GridPoint) => {
     const key = pointToKey(point);
+    console.log('[DEBUG 1: toggleObstacle] Clicked/toggled point:', point, 'key:', key);
     if (pointToKey(startPos) === key || pointToKey(goalPos) === key || pointToKey(roverPos) === key) {
+      console.log('[DEBUG 1: toggleObstacle] Ignored because point is start, goal, or rover position');
       return;
     }
 
@@ -563,30 +664,40 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
 
     if (wasObstacle) {
       nextObstacles.delete(key);
-      setObstacles(nextObstacles);
-      setGridMatrix((prev) => {
-        if (!prev) return prev;
-        return prev.map((row, y) =>
-          row.map((cell, x) => (x === point.x && y === point.y ? 0 : cell))
-        );
-      });
+    } else {
+      nextObstacles.add(key);
+    }
+
+    // Format as [[x, y], ...]
+    const obstaclesPayload: number[][] = Array.from(nextObstacles).map((k) => {
+      const [x, y] = k.split(',').map(Number);
+      return [x, y];
+    });
+
+    console.log('[DEBUG 1: toggleObstacle] Next obstacles count:', nextObstacles.size, 'Calling sendObstacles with payload:', JSON.stringify(obstaclesPayload));
+
+    setObstacles(nextObstacles);
+    currentObstaclesRef.current = nextObstacles;
+
+    setGridMatrix((prev) => {
+      if (!prev) {
+        const matrix = Array.from({ length: 12 }, () => Array.from({ length: 12 }, () => 0));
+        matrix[point.y][point.x] = wasObstacle ? 0 : 1;
+        return matrix;
+      }
+      return prev.map((row, y) =>
+        row.map((cell, x) => (x === point.x && y === point.y ? (wasObstacle ? 0 : 1) : cell))
+      );
+    });
+
+    // Send updated obstacle list to backend
+    sendObstacles(obstaclesPayload);
+
+    if (wasObstacle) {
       const res = runPathfinding('A*', roverPos, goalPos, nextObstacles);
       setCurrentPath(res.path);
       setPathLength(res.pathLength);
     } else {
-      nextObstacles.add(key);
-      setObstacles(nextObstacles);
-      setGridMatrix((prev) => {
-        if (!prev) {
-          const matrix = Array.from({ length: 12 }, () => Array.from({ length: 12 }, () => 0));
-          matrix[point.y][point.x] = 1;
-          return matrix;
-        }
-        return prev.map((row, y) =>
-          row.map((cell, x) => (x === point.x && y === point.y ? 1 : cell))
-        );
-      });
-
       const wasNavigating = missionState === 'NAVIGATING';
       setMissionState('REPLANNING');
       setPipelineStep('OBSTACLE_ADDED');
@@ -614,6 +725,7 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
   };
 
   const addObstacleInPath = () => {
+    console.log('[DEBUG 1: addObstacleInPath] Triggered. Current path length:', currentPath.length, 'path:', JSON.stringify(currentPath));
     if (currentPath.length > 2) {
       toggleObstacle(currentPath[2]);
     } else if (currentPath.length > 1) {
@@ -624,13 +736,17 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
   const clearObstacles = () => {
     const emptySet = new Set<string>();
     setObstacles(emptySet);
+    currentObstaclesRef.current = emptySet;
     setGridMatrix(Array.from({ length: 12 }, () => Array.from({ length: 12 }, () => 0)));
+    sendObstacles([]);
     const res = runPathfinding('A*', roverPos, goalPos, emptySet);
     setCurrentPath(res.path);
     setPathLength(res.pathLength);
   };
 
-  const resetRover = () => {
+  const resetRover = async () => {
+    await sendMissionCommand('reset');
+
     setRoverPos(startPos);
     setMissionState('IDLE');
     setDistanceTravelled(0);
@@ -640,6 +756,7 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
     setTargetDetected(false);
     setPipelineStep('IDLE');
     setHeading(90);
+
     const res = runPathfinding('A*', startPos, goalPos, obstacles);
     setCurrentPath(res.path);
     setPathLength(res.pathLength);
@@ -677,6 +794,8 @@ export function RoboticsProvider({ children }: { children: React.ReactNode }) {
         backendConnected,
         setBackendConnected,
         lastSuccessfulPoll,
+        lastObstaclePost,
+        lastBackendError,
         apiStatus,
         apiNavigation,
         apiTelemetry,

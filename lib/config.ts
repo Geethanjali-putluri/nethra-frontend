@@ -5,17 +5,18 @@
  */
 
 export const DEFAULT_BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL ||
-  'https://nethra-api-aemt.onrender.com';
+  process.env.NEXT_PUBLIC_BACKEND_URL || '';
 
 export const API_ENDPOINTS = {
   STATUS: '/api/status',
   NAVIGATION: '/api/navigation',
   TELEMETRY: '/api/telemetry',
+  OBSTACLES: '/api/obstacles',
   MISSION_START: '/api/mission/start',
   MISSION_STOP: '/api/mission/stop',
   MISSION_EMERGENCY_STOP: '/api/mission/emergency-stop',
   MISSION_RESUME: '/api/mission/resume',
+  MISSION_RESET: '/api/mission/reset',
 } as const;
 
 export const POLLING_INTERVAL_MS = 3000;

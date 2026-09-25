@@ -2,6 +2,7 @@
 
 import React from 'react';
 import { useRobotics } from '@/lib/robotics-context';
+import { DebugPanel } from './DebugPanel';
 import {
   Play,
   Square,
@@ -511,6 +512,9 @@ export function DashboardView() {
           </div>
         </div>
       </div>
+
+      {/* Temporary Debug Audit Panel placed at the bottom of the dashboard */}
+      <DebugPanel />
     </div>
   );
 }

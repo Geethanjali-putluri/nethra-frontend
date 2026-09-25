@@ -12,12 +12,18 @@ export async function GET() {
     Array.from({ length: 12 }, (_, x) => (obstaclesSet.has(`${x},${y}`) ? 1 : 0))
   );
 
+  const activePath = state.missionState === 'NO_SAFE_PATH'
+    ? []
+    : state.activePath && state.activePath.length > 0
+    ? state.activePath
+    : result.path;
+
   return NextResponse.json({
     grid,
     start: [state.startPos.x, state.startPos.y],
     goal: [state.goalPos.x, state.goalPos.y],
     rover: [state.roverPos.x, state.roverPos.y],
-    path: result.path.map((pt) => [pt.x, pt.y]),
+    path: activePath.map((pt) => [pt.x, pt.y]),
     // Extra telemetry metrics
     gridSize: 12,
     roverPos: state.roverPos,
