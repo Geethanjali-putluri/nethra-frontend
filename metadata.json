@@ -1,0 +1,6 @@
+{
+  "name": "NETHRA — Autonomous Search & Rescue UGV",
+  "description": "Professional robotics control and monitoring station for NETHRA autonomous search and rescue UGV prototype featuring phone camera vision, YOLO11 detection, 12x12 occupancy grid, A* path planning simulation, and algorithm benchmarks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
